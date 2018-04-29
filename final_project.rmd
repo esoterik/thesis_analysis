@@ -1,0 +1,860 @@
+---
+title: "Predicting the Open Source Software Contributor Pipeline"
+author: "Sydney Young"
+date: "April 27 2018"
+output: 
+  pdf_document: 
+    fig_caption: yes
+    highlight: tango
+    includes:
+      in_header: preamble-latex.tex
+fontsize: 12pt
+geometry: margin=1in
+---
+```{r include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, results = 'hide', message = FALSE,
+                      warning = FALSE, error = FALSE, eval = TRUE,
+                      fig.show = 'hide')
+```
+```{r, include = FALSE, message = FALSE, fig.show = 'hide'}
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(readr)
+library(plyr)
+library(lme4)
+library(lmerTest)
+library(caret)
+library(fifer)
+```
+
+```{r fig.show = 'hide'}
+users <- read.csv('users_to_pred.csv', as.is = TRUE)
+included_contribs <- read.csv('included_contribs.csv', as.is = TRUE)
+x <- merge(users, included_contribs, by.x = 'id', by.y = 'user_id')
+
+# remove some columns: name, username, email, location, bio, company,
+# excluded, ID, duplicated ID column, first_name, blog
+names(x)[c(1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 16)]
+x <- x[, -c(1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 16)]
+names(x)
+
+# parse dates
+x$first_pr <- parse_datetime(x$first_pr, format = "%Y-%m-%d %H:%M:%S %Z")
+x$last_pr <- parse_datetime(x$last_pr, format = "%Y-%m-%d %H:%M:%S %Z")
+x$first_commit <- parse_datetime(x$first_commit, format = "%Y-%m-%d %H:%M:%S %Z")
+x$last_commit <- parse_datetime(x$last_commit, format = "%Y-%m-%d %H:%M:%S %Z")
+x$first_issue_opened <- parse_datetime(x$first_issue_opened, format = "%Y-%m-%d %H:%M:%S %Z")
+
+# convert repository ID to a factor
+x$repo <- factor(x$repo_id)
+x$repo <- mapvalues(x$repo, from = c(1, 2, 3, 4, 5, 6, 7),
+                    to = c("bundler", "rails", "node", "jquery", "rust", "webpack", "ember"))
+
+# parse true/false columns
+x$more_than_a_year <- as.logical(x$more_than_a_year)
+x$active <- as.logical(x$active)
+
+# convert gender to factor
+x$gender <- factor(x$gender_name)
+
+# let's drop these because there's no distinction!
+table(x$first_pr_status)
+table(x$last_pr_status)
+x <- x[, -c(16, 17)]
+
+# remove repo_id
+x <- x[, -c(6)]
+# remove gender_name
+x <- x[, -c(1)]
+
+# drop this user due to no sentiment data
+x <- x[-which(is.na(x$sentiment_by)), ]
+x <- x[-which(is.na(x$sentiment_toward_other)),]
+
+x <- x[,c("total_commits", "length", "frequency", "more_than_a_year", "total_prs",
+         "gender_prob", "sentiment_toward_notable", "sentiment_toward_other", 
+         "sentiment_by", "active", "diff", "avg_commit_size", 
+         "commits_at_first_pr",  "total_adds", "total_dels", "gender", "repo",
+         "first_pr", "last_pr", "first_commit", "last_commit", 
+         "first_issue_opened")]
+
+date_columns <- c(18:22)
+factor_columns <- c(10, 16, 17)
+
+x$total_commits_log <- log(x$total_commits)
+x$length_sqrt <- sqrt(x$length)
+x$avg_commit_size_scaled <- scale(x$avg_commit_size)
+```
+
+```{r, eval = FALSE}
+
+hist(x$total_commits)
+hist(log(x$total_commits + 1))
+hist(log(x$frequency + 1))
+
+hist(exp(x$frequency))
+hist(log(x$length + 1))
+hist(sqrt(x$length))
+
+# we have two outliers in frequency / length that have
+# unusually short contribution lengths
+x[which(exp(x$frequency) > 1.0002),]$username
+x[which(log(x$length + 1) < 11),]$username
+
+table(x$more_than_a_year)
+
+table(x$gender)
+hist(x$gender_prob)
+
+hist(x$sentiment_by)
+hist(x$sentiment_toward_notable)
+hist(x$sentiment_toward_other)
+hist(log(x$avg_commit_size + 1))
+
+boxplot(log(x$total_commits + 1) ~ x$gender)
+plot(log(x$total_commits + 1) ~ x$gender_prob)
+
+boxplot(x$sentiment_by ~ x$gender)
+boxplot(x$sentiment_toward_notable ~ x$gender)
+boxplot(x$sentiment_toward_other ~ x$gender)
+
+boxplot(x$length ~ x$gender)
+
+hist(x$diff)
+plot(x$length ~ log(x$avg_commit_size + 1))
+
+boxplot(x$length ~ x$repo)
+
+table(x$active)
+
+pairs(x[, -c(2, 3, 4, 5, factor_columns, date_columns)])
+pairs(x[, -c(1, 2, 3, 4, 5, factor_columns, date_columns)])
+cor(x[, -c(1:5, factor_columns, date_columns)])
+```
+
+```{r, eval = FALSE}
+log_commits_initial <- lm(total_commits_log ~ 1, data = x)
+step(log_commits_initial,
+     scope = list(lower=~1,
+                  upper=~gender+sentiment_toward_notable+sentiment_toward_other+
+                    sentiment_by+diff+avg_commit_size+commits_at_first_pr+repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "forward")
+log_commits_forward <-lm(formula = total_commits_log ~ repo + commits_at_first_pr + 
+                           sentiment_toward_notable, data = x)
+backward_initial <- lm(total_commits_log ~ gender+sentiment_toward_notable+sentiment_toward_other+
+                    sentiment_by+diff+avg_commit_size+commits_at_first_pr+repo +
+                      sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender, data = x)
+step(backward_initial,
+     scope = list(lower=~1,
+                  upper=~gender+sentiment_toward_notable+sentiment_toward_other+
+                    sentiment_by+diff+avg_commit_size+commits_at_first_pr+repo + 
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "backward")
+log_commits_backward <-lm(formula = total_commits_log ~ sentiment_toward_notable + commits_at_first_pr + 
+                            repo, data = x) 
+step(log_commits_initial,
+     scope = list(lower=~1,
+                  upper=~gender+sentiment_toward_notable+sentiment_toward_other+
+                    sentiment_by+diff+avg_commit_size+repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "both")                          
+```
+```{r}
+log_commits_both <- lm(formula = total_commits_log ~ repo + sentiment_toward_notable, data = x)
+summary(log_commits_both)
+par(mfrow = c(2,2))
+plot(log_commits_both)
+par(mfrow = c(1,1))
+```
+
+```{r, eval = FALSE}
+length_sqrt_initial <- lm(length_sqrt ~ 1, data = x)
+step(length_sqrt_initial,
+     scope = list(lower = ~ 1,
+                  upper = ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size + commits_at_first_pr + repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "forward")
+length_sqrt_forward <- lm(formula = length_sqrt ~ repo + commits_at_first_pr + diff + 
+                            avg_commit_size + sentiment_toward_notable, data = x)
+length_sqrt_full <- lm(length_sqrt ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size + commits_at_first_pr + repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender, data = x)
+step(length_sqrt_full,
+     scope = list(lower = ~ 1,
+                  upper = ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size + commits_at_first_pr + repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "backward")
+length_sqrt_backward <- lm(formula = length_sqrt ~ sentiment_toward_notable + diff + 
+                             avg_commit_size + commits_at_first_pr + repo, data = x)
+
+step(length_sqrt_initial,
+     scope = list(lower = ~ 1,
+                  upper = ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size + repo +
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + repo * gender),
+     direction = "both")
+```
+```{r}
+length_sqrt_final <- lm(formula = length_sqrt ~ repo + diff + 
+                          avg_commit_size + sentiment_toward_notable, data = x)
+summary(length_sqrt_final)
+par(mfrow = c(2,2))
+plot(length_sqrt_final)
+par(mfrow = c(1,1))
+```
+
+```{r, eval = FALSE}
+null <- lmer(total_commits_log ~ avg_commit_size_scaled + (1|repo), data=x)
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + gender + (1|repo), data=x)
+anova(null, model)
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable + (1|repo), data=x)
+anova(null, model)
+null <- model
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable * 
+                sentiment_by + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable * 
+                gender + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable * 
+                gender_prob + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable + 
+                gender_prob + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable * 
+                sentiment_by + (1|repo), data=x)
+anova(null, model)
+
+null <- lmer(total_commits_log ~ avg_commit_size_scaled + (1|repo), data=x)
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_by + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable + (1|repo), data=x)
+null <- model
+model <- lmer(total_commits_log ~ avg_commit_size_scaled + sentiment_toward_notable + 
+                sentiment_toward_other + (1|repo), data=x)
+anova(null, model)
+total_commits_lmer <- null
+```
+```{r}
+null_total_commits <- lmer(total_commits_log ~ (1|repo), data=x)
+full_total_commits <- lmer(total_commits_log ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size_scaled + 
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + (1|repo), data = x)
+step_results <- step(full_total_commits, keep = c("(1|repo)"))
+total_commits_lmer <- get_model(step_results)
+total_commits_lmer
+anova(null_total_commits, total_commits_lmer)
+```
+
+```{r, eval = FALSE}
+null <- lmer(length_sqrt ~ avg_commit_size_scaled + (1|repo), data=x)
+model <- lmer(length_sqrt ~ avg_commit_size_scaled + gender + (1|repo), data=x)
+anova(null, model)
+null <- model
+model <- lmer(length_sqrt ~ avg_commit_size_scaled + gender +
+                sentiment_toward_notable + (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(length_sqrt ~ avg_commit_size_scaled + gender * sentiment_toward_notable +
+                (1|repo), data=x)
+anova(null, model)
+
+model <- lmer(length_sqrt ~ avg_commit_size_scaled + gender + sentiment_by +
+                (1|repo), data=x)
+anova(null, model)
+length_sqrt_lmer <- null
+```
+```{r}
+null_length_sqrt <- lmer(length_sqrt ~ (1|repo), data=x)
+full_length_sqrt <- lmer(length_sqrt ~ gender + sentiment_toward_notable + sentiment_toward_other +
+                    sentiment_by + diff + avg_commit_size_scaled + 
+                    sentiment_toward_notable*gender + sentiment_toward_other * gender +
+                    sentiment_by * gender + (1|repo), data = x)
+step_results <- step(full_length_sqrt, keep = c("(1|repo)"))
+length_sqrt_lmer <- get_model(step_results)
+```
+
+```{r, eval = FALSE}
+# cross validation: stratified montecarlo
+set.seed(1)
+# linear log total commits
+errors_linear_commits <- rep(0, 100)
+for (i in 1:100) {
+  # split into 80/20 test/train sets keeping repo, gender ratios the same
+  # between sets
+  s <- stratified(x, c("repo", "gender"), 0.8, bothSets = TRUE)
+  train <- s$SET1
+  test <- s$SET2
+  model <- lm(formula = total_commits_log ~ repo + sentiment_toward_notable, data = train)
+  pred <- predict(model, test)
+  errors_linear_commits[i] <- sum((pred - test$total_commits_log)^2) / nrow(test)
+}
+mean(errors_linear_commits)
+var(errors_linear_commits)
+```
+
+```{r, eval = FALSE}
+errors_lmer_commits <- rep(0, 100)
+for (i in 1:100) {
+  # split into 80/20 test/train sets keeping repo, gender ratios the same
+  # between sets
+  s <- stratified(x, c("repo", "gender"), 0.8, bothSets = TRUE)
+  train <- s$SET1
+  test <- s$SET2
+  model <-  lmer(total_commits_log ~ (1|repo), data=train)
+  pred <- predict(model, test)
+  errors_lmer_commits[i] <- sum((pred - test$total_commits_log)^2) / nrow(test)
+}
+mean(errors_lmer_commits)
+var(errors_lmer_commits)
+```
+```{r, eval = FALSE}
+errors_linear_length <- rep(0, 100)
+for (i in 1:100) {
+  # split into 80/20 test/train sets keeping repo, gender ratios the same
+  # between sets
+  s <- stratified(x, c("repo", "gender"), 0.8, bothSets = TRUE)
+  train <- s$SET1
+  test <- s$SET2
+  model <-  lm(formula = length_sqrt ~ repo + diff + 
+                 avg_commit_size + sentiment_toward_notable, data = train)
+  pred <- predict(model, test)
+  errors_linear_length[i] <- sum((pred - test$length_sqrt)^2) / nrow(test)
+}
+mean(errors_linear_length)
+var(errors_linear_length)
+```
+
+```{r, eval = FALSE}
+errors_lmer_length <- rep(0, 100)
+for (i in 1:100) {
+  # split into 80/20 test/train sets keeping repo, gender ratios the same
+  # between sets
+  s <- stratified(x, c("repo", "gender"), 0.8, bothSets = TRUE)
+  train <- s$SET1
+  test <- s$SET2
+  model <-  lmer(length_sqrt ~ sentiment_toward_other + gender + (1|repo), data=train)
+  pred <- predict(model, test)
+  errors_lmer_length[i] <- sum((pred - test$length_sqrt)^2) / nrow(test)
+}
+mean(errors_lmer_length)
+var(errors_lmer_length)
+```
+
+```{r}
+commits_linear_df <- data.frame(log_commits_both$fitted.values, log_commits_both$residuals)
+names(commits_linear_df) <- c("fitted.values", "residuals")
+commits_linear_residuals <- ggplot(commits_linear_df, aes(fitted.values, residuals)) +
+  theme_linedraw() +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x="Fitted Values", y="Residuals", title="Residuals of Commits\nFixed-Effects Model")
+
+fitted <- predict(null_total_commits, x)
+resid <- fitted - x$total_commits_log
+commits_lmer_df <- data.frame(fitted, resid)
+names(commits_lmer_df) <- c("fitted.values", "residuals")
+commits_lmer_residuals <- ggplot(commits_lmer_df, aes(fitted.values, residuals)) +
+  theme_linedraw() +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x="Fitted Values", y="Residuals", title="Residuals of Commits\nMixed-Effects Model")
+
+length_linear_df <- data.frame(length_sqrt_final$fitted.values, length_sqrt_final$residuals)
+names(length_linear_df) <- c("fitted.values", "residuals")
+length_linear_residuals <- ggplot(length_linear_df, aes(fitted.values, residuals)) +
+  theme_linedraw() +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x="Fitted Values", y="Residuals", title="Residuals of Length\nFixed-Effects Model")
+
+fitted <- predict(length_sqrt_lmer, x)
+resid <- fitted - x$length_sqrt
+length_lmer_df <- data.frame(fitted, resid)
+names(length_lmer_df) <- c("fitted.values", "residuals")
+length_lmer_residuals <- ggplot(length_lmer_df, aes(fitted.values, residuals)) +
+  theme_linedraw() +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x="Fitted Values", y="Residuals", title="Residuals of Length\nMixed-Effects Model")
+```
+
+```{r}
+shrink_text <- element_text(size = rel(0.85))
+shrink_text_slight <- element_text(size = rel(0.95))
+
+commit_size_dist <- ggplot(x, aes(avg_commit_size)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Average Commit Size", y = 'Density')
+
+diff_dist <- ggplot(x, aes(diff)) +
+  theme_linedraw() +
+  theme(axis.title.x = shrink_text_slight) +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Time Between First\nPR and Commit\n(seconds)", y = 'Density')
+
+sentiment_by_dist <- ggplot(x, aes(sentiment_by)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Sentiment in Comments\nAuthored by Users", y = 'Density')
+
+sentiment_toward_other_dist <- ggplot(x, aes(sentiment_toward_other)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Sentiment in Comments\nAuthored by Unknown Users\nToward each User", y = 'Density')
+
+sentiment_toward_notable_dist <- ggplot(x, aes(sentiment_toward_notable)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Sentiment in Comments\nAuthored by Known Users\nToward each User", y = 'Density')
+
+gender_dist <- ggplot(x, aes(gender_prob)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Gender\n(-1 = Male, 1 = Female)", y = 'Density')
+
+repo_gender_bar <- ggplot(x, aes(repo)) +
+  theme_linedraw() +
+  theme(legend.position = 'none', plot.title = shrink_text_slight, axis.title = shrink_text_slight) +
+  geom_bar(aes(fill = gender)) +
+  coord_flip() +
+  labs(x="", y="Count", title="Users by Project\nand Gender")
+
+commit_log_by_gender <- ggplot(x, aes(total_commits_log)) +
+  theme_linedraw() +
+  theme(legend.position = 'top', plot.title = shrink_text_slight, axis.title = shrink_text_slight) +
+  geom_density(alpha = 0.4, aes(color = gender, fill = gender)) +
+  labs(x="log(Total Commits)", y="Density", title="Commits by Gender")
+
+length_sqrt_by_gender <- ggplot(x, aes(length_sqrt)) +
+  theme_linedraw() +
+  theme(legend.position = 'none', plot.title = shrink_text_slight, axis.title = shrink_text_slight) +
+  geom_density(alpha = 0.4, aes(color = gender, fill = gender)) +
+  labs(x="sqrt(Length)\n(sqrt(seconds))", y="Density", title="Length of\nContribution\nby Gender")
+
+commit_log_by_repo <- ggplot(x, aes(total_commits_log)) +
+  theme_linedraw() +
+  theme(legend.position = 'left') +
+  geom_density(alpha = 0.4, aes(color = repo, fill = repo)) +
+  labs(x="log(Total Commits)", y="Density", title="Commits by Project")
+
+length_sqrt_by_repo <- ggplot(x, aes(length_sqrt)) +
+  theme_linedraw() +
+  theme(legend.position = 'none') +
+  geom_density(alpha = 0.4, aes(color = repo, fill = repo)) +
+  labs(x="sqrt(Length) (sqrt(seconds))", y="Density", title="Length of Contribution\nby Project")
+
+sentiment_by_repo <- ggplot(x, aes(repo, sentiment_by)) +
+  theme_linedraw() +
+  theme(plot.title = shrink_text, axis.title = shrink_text) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Sentiment in Authored Comments by Project",
+       x = "", y = "Sentiment Score")
+
+sentiment_toward_notable_by_repo <- ggplot(x, aes(repo, sentiment_toward_notable)) +
+  theme_linedraw() +
+  theme(plot.title = shrink_text, axis.title = shrink_text) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title ="Sentiment in Comments Authored by Known Users\nToward each User",
+       x = "", y = "Sentiment Score")
+sentiment_toward_other_by_repo <- ggplot(x, aes(repo, sentiment_toward_other)) +
+  theme_linedraw() +
+  theme(plot.title = shrink_text, axis.title = shrink_text) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title ="Sentiment in Comments Authored by Unknown Users\nToward each User",
+       x = "", y = "Sentiment Score")
+
+total_commit_dist <- ggplot(x, aes(total_commits)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Total Commits", y = 'Density')
+total_commit_log_dist <- ggplot(x, aes(total_commits_log)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "log(Total Commits)", y = 'Density')
+length_dist <- ggplot(x, aes(length)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "Length of Contribution (seconds)", y = 'Density')
+length_sqrt_dist <- ggplot(x, aes(length_sqrt)) +
+  theme_linedraw() +
+  geom_density(alpha = 0.8, fill = "black") +
+  labs(x = "sqrt(Length of Contribution)\n(seconds)", y = 'Density')
+last_plot()
+```
+
+
+# Abstract
+Modern technology is increasingly reliant on open source software.
+The use of open frameworks is so ubiquitous and necessary that proprietary software companies make use of and often financially support certain projects. Now more than ever, decisions made by maintainers of open source libraries can have a seemingly outsized impact beyond the project, depending on the severity of the decision, simply due to the number of others that rely on their project. This project explores
+the process of becoming a regular contributor to an open source project by using data
+from GitHub. The analysis pays special attention to the gender of contributors,
+as there is a well-known systemic sexism issue in open source software.
+
+# Background
+
+Free/Open source software (FOSS) is increasingly prevalent in society, to the extent that some claim “we’re in a brave, post open source world”, meaning that software is mostly open source by default (Eghbal).
+This is partly due to the increasing popularity of open licenses that allow use of the such software in proprietary applications, such as the MIT license. Software licenses in this category have resulted in the widespread use and support for open source platforms. 
+Analyzing the FOSS community and process is important for two major reasons: first, that the programmers producing software often have an outsized impact on society if the project is successful, and second, the entire process of producing FOSS can be analyzed. Frequently FOSS projects also have incredibly public inter-team interactions, which allows for analysis of team dynamics and decision-making that isn’t nearly as possible with closed-source software. 
+
+There have been several widely-cited studies analyzing the FOSS community as a whole, but the vast majority of them were conducted in the early 2000s, prior to the advent of GitHub. GitHub, a website for hosting and sharing code repositories (“social coding”), launched in 2008 and has had an extreme impact on the FOSS community. GitHub makes it extremely easy to make any code available to the entire internet and additionally supplies a host of project management utilities such as issue tracking. A handful of more recent studies exist, such as “What makes a good contributor?” by Kevin Carillo, Sid Huff, and Brenda Chawner looks at how new contributors to FOSS are socialized. There are many informal analyses of GitHub data online, but most tend to look
+at questions with a more general scope, like tracking language popularity or sentiment
+in commit messages.
+
+Gender dynamics are particularly important to any analysis of technology creators,
+and the open source community is no different. It is a notoriously sexist and
+even rude community -- Richard Stallman and Linus Torvalds, two of the paragons
+of the wider open source community, have contributed to setting this tone. While
+informality and a harsh criticisms aren't necessarily a problem for anyone,
+they can often push out community members who already feel as if they don't belong.
+For these reasons, this analysis has a slight focus on gender differences in
+the GitHub data.
+
+# Methods
+This analysis had three major parts to it: writing software to gather the raw data from GitHub’s APIs, preliminary analysis of this data to create predictor variables, and finally building predictive models. 
+
+## Constructing the Dataset
+GitHub provides two APIs for accessing their public data: a traditional REST API and a more cutting-edge GraphQL interface. Both were utilized to construct the data set used in this analysis. A small Ruby on Rails app was created for this purpose. Rails was chosen as the framework for this database-building software because it allows easy interfacing with SQL databases, and the Octokit and graphql-client Ruby gems simplify interacting with the GitHub APIs. See Appendix 1 for the source code of this application.
+
+Seven open source projects were chosen for analysis: Bundler (a Ruby gem used for managing gem installations), Rails (a MVC web application framework in Ruby), Rust (a systems programming language intended as a more modern C++), Node.js (a JavaScript runtime), jQuery (a JavaScript library), Webpack (a JavaScript module bundler), and Ember.js (a JavaScript framework). These projects were chosen because of their widespread use and their funding sources. None of these projects are mainly supported by a single company: they all have at least a few independent companies who pay for some of their development or are funded through a foundation. This last point is important to analyzing the contributor pipeline. Projects that are backed by a single company have a different contributor path than those that are funded by organizations, as the core team that makes the most significant contributions comes about from the company rather than arising from independent contributors.
+
+Table 1 shows the data that was pulled for each repository and which GitHub API was used to obtain it. Even with just seven repositories, there was **X** MB of data downloaded. The GitHub API is rate-limited, so retrieving this much data required the creation of an automated runner that would download as much as possible until the limit was reached, starting again when the hourly rate limit reset happened.
+
+|  Object            | Attributes | Notes                                                  |
+|-------------------:|:-----------|:-------------------------------------------------------|
+| User | name, username | Roughly the top 100 contributors to each project |
+| | |
+| Commits | SHA-1 hash, message, additions, deletions, time stamp, author | All for each project, Author is nil if not one of the retrieved users |
+| | |
+| Commits | SHA-1 hash, message, additions, deletions, time stamp, author | All for each project, Author is nil if not one of the retrieved users |
+| Issues | title, body, status (open or closed), number, author, time opened, time closed | Author is nil if not one of the retrieved users, All for each project |
+| | |
+| Pull Requests | title, body, status (open, closed, merged), author, time opened, time closed/merged | Author is nil if not one of the retrieved users, All for each project |
+| | |
+| Comments | author, body, time created, length, issue or pull request | All comments on issues and pull requests for each project, author is nil if not one of the retrieved users |
+: Data pulled from GitHub
+
+## Preliminary Analysis
+Prior to model fitting, some metrics were produced from the raw GitHub data on a per-user basis, as shown in Table 2. Gender was determined from the user’s full name, if present, using the Namesor API. Users were excluded from this and further analysis if they had contributed to more than one repository, though they still counted as a part of the set of “known users”. Users were also excluded if they made their first commit to the repository before the first pull request was opened; this is to exclude early contributors and only include those who could have a similar path to becoming a regular contributor.
+
+| Attribute           | Description                                                       |
+|--------------------:|:------------------------------------------------------------------|
+| Gender  | Male, female, other |
+| | |
+| Gender Score | -1 to 1, -1 being definitely male and +1 being definitely female |
+| | |
+| Sentiment By | The average sentiment of comments made by the user |
+| | |
+| Sentiment Toward, Notable | The average sentiment of comments made by “known users” in conversations the user was involved in |
+| | |
+| Sentiment Toward, Other | The average sentiment of comments made by “unknown users” in conversations the user was involved in |
+| | |
+| First Pull Request | The time the user opened their first PR |
+| | |
+| Last Pull Request | The time the user opened their last PR |
+| | |
+| First Commit | The time the user made their first commit |
+| | |
+| Last Commit | The time the user made their last commit |
+| | |
+| Total Commits | The total number of commits made by the user |
+| | |
+| Average Commit size | The average of the sum of additions and deletions of each of the user’s commits |
+| | |
+| Length of Contribution | The time difference between the user’s first and last commits, in seconds |
+| | |
+| Frequency of Contribution | Total Commits / Length of Contribution |
+| | |
+| Time until first PR merged | Time difference between the First pull request and the first commit |
+| | |
+| Number of commits at first PR | The number of commits in the project when the user opened their first PR |
+| | |
+| Total Pull Requests | Number of pull request authored by the user |
+| | |
+| Total Additions | total additions made by the user in commits |
+| | |
+| Total Deletions | total deletions made by the user in commits |
+| | |
+| More than a Year | true if the user contributed to the project for more than 1 year |
+| | |
+| Active | true if the last commit was within one month |
+| | |
+| Repo | the name of the user's project |
+: Final data set description
+
+The sentiment analysis of comment data proved to be a difficult problem. The initial approach was to use IBM Watson’s natural language understanding feature to both label positive/negative sentiment as well as the emotional components. However, the sheer number of comments (**X** at a mean size of **Y**) meant that this approach was not feasible from both a time and money standpoint (roughly 10 hours of processing for 60,000 comments which used up all of the free resources). This forced a much simpler sentiment analysis with a bag-of-words model of language. The Sentimental gem implements this by tokenizing the text, mapping each token to a predetermined sentiment, and then averaging the sentiments in the text. There are many issues with a bag-of-words approach to sentiment, which will be discussed further in this paper, but with the sheer volume of text that needed to be processed it was the best option.
+
+## Predictive Modeling
+To best analyze the factors that lead to a developer becoming a regular
+contributor to a project, models were built to predict both the total number
+of commits a user made to a project and the amount of time the user was a
+contributor to the project. Linear regression was used to create the models:
+
+\begin{align*}
+Y_i = E(Y | X = x) + e_i = \beta_0 + \beta_1 x + \beta_2 x + ... + e_i
+\end{align*}
+
+
+This approach was chosen because with a few basic transformations the response variables were distributed
+fairly normally. Additionally, none of the predictor variables seemed to
+have any more complicated (e.g. quadratic) relationships to these two reponses.
+Both fixed and random effects were investigated: it was not assumed that 
+the projects in this data exhaust the population of all open source projects
+on GitHub. The mixed effects models are defined as follows for user *i* and
+repository *j*:
+
+\begin{align*}
+Y_{ij} = E(Y | X = x) + e_i = \beta_0 + \beta_1 x + \beta_2 x + ... + b_j + e_ij
+\end{align*}
+
+
+Akaike's Information Criterion (AIC) was used to select variables for the 
+models via stepwise iterations (Sheather):
+\begin{align*}
+\text{AIC} = 2[(p + 2) - \log(L(\hat{\beta_0}, \hat{\beta_1},...,\hat{\beta_p}, \hat{\sigma^2} | Y))]
+\end{align*}
+
+Monte Carlo cross validation was used to calculate and compare
+mean-squared error between the final models (one with only fixed effects and
+one with random effects for each response).
+
+# Results
+
+## Exploratory Analysis
+
+```{r, fig.show='asis', fig.cap='Distributions of response variables and transformations', fig.height=3.5}
+grid.arrange(total_commit_dist, total_commit_log_dist, length_dist,
+             length_sqrt_dist, ncol = 2)
+```
+
+Figure 1 shows the distributions of the two response variables: total commit count
+and the length of the user's contribution period. They were initially distributed
+in a way that was far from normal, so the log was taken of total commit count
+and the square root was taken of the length.
+
+```{r, fig.show='asis', fig.cap = 'Distributions of predictor variables'}
+grid.arrange(commit_size_dist, diff_dist, gender_dist, sentiment_by_dist,
+             sentiment_toward_notable_dist, sentiment_toward_other_dist,
+             ncol = 3)
+```
+
+Figure 2 shows the distributions of several predictor variables. Average commit
+size and the time difference predictors have some notably large outliers. The 
+gender probability distribtion shows that there are many more confidently male
+users than any other category. The sentiment distributions show that the user's
+average comments are mostly neutral to positive, comments made towards them
+by known users are also positive-leaning but to a lesser extent, and comments
+made by unknown users have more of a spread than the other two categories.
+
+```{r, fig.show='asis', fig.cap='Gender variations', fig.height=3}
+grid.arrange(repo_gender_bar, commit_log_by_gender, length_sqrt_by_gender,
+             ncol = 3)
+```
+
+Figure 3 shows several plots relating to gender distributions. Gender is distributed
+roughly the same between projects. Those with identified genders have pretty
+similar total commit distributions, while unknown genders spikes at around
+4.5 $\log(Total\_Commits)$. Unknown users also appear to have a shorter
+average contribution time.
+
+```{r, fig.show='asis', fig.cap='Response variables by project', fig.height=3}
+grid.arrange(commit_log_by_repo, length_sqrt_by_repo, ncol=2)
+```
+
+Figure 4 shows distributions of response variables per project; almost all of
+the projects have very different total commits per user and different 
+contribution times per user.
+
+
+## Final Models
+
+Potential predictor variables considered included: gender, sentiment by,
+sentiment toward by known users, sentiment toward by other users, mean commit
+size, time until first pull request merged (*diff*), and the project, 
+as well as all possible interactions between these variables.
+
+### Total Commits
+
+| Variable | Coefficient | p value |
+|:---------|-------------|---------|
+| (Intercept)              |  3.6181     |  < 2e-16 |
+| reporails                |  1.8505     | 1.16e-12 |
+| reponode                 |  0.6052     |   0.0166 |
+| repojquery               |  0.6132     |   0.0956 |
+| reporust                 |  1.9184     | 1.96e-15 |
+| repowebpack              | -0.3327     |   0.2540 |
+| repoember                |  0.4027     |   0.0837 |
+| sentiment_toward_notable | -0.7959     |   0.0845 |
+: Linear fixed-effects model of $\log(total\_commits)$
+
+The coefficients of the fixed-effects model predicting $\log(total\_commits)$ are
+shown in Table 3. The model has an overall p-value of near 0 and an $R^2$ of 
+0.3457. 
+
+| Variable | Coefficient |
+|:---------|-------------|
+| Intercept: bundler  |  3.442494 |
+| Intercept: rails    |  5.204683 |
+| Intercept: node     |  4.107629 |
+| Intercept: jquery   |  4.084237 |
+| Intercept: rust     |  5.389518 |
+| Intercept: webpack  |  3.264230 |
+| Intercept: ember    |  3.845984 |
+: Linear mixed-effects model of $\log(total\_commits)$
+
+When the project was considered to be a random effect, the only significant
+predictor was this random effect. The mixed-effects intercepts are shown in 
+Table 4.
+
+| Model                  | Mean Squared Error | Mean of Response Variable | % Error |
+| -----------------------|--------------------|---------------------------|---------|
+| Commits fixed-effects  | 1.257016 | 4.403036 | 28.54885 % |
+| Commits mixed-effects  | 1.300374 | 4.403036 | 29.53358 % |
+: Monte Carlo cross validation for predicting $\log (total\_commits)$
+
+Table 5 shows the results of performing Monte Carlo cross validation for 100
+iterations on the commits models. The fixed-effects model performs slightly
+better than the mixed-effects model and the MSE is quite low considering that
+the $R^2$ of the fixed-effects model was just 0.3457.
+
+```{r, fig.show='asis', fig.cap='Residual plots for commit models. The blue line is a linear line of best fit.', fig.height=3}
+grid.arrange(commits_linear_residuals, commits_lmer_residuals, ncol=2)
+```
+
+Figure 5 shows the residual plots for these models, and the fixed-effects model
+shows a pretty good spread of residuals: the errors are spread roughly equally
+between large and small fitted values.
+
+### Length of Contribution
+
+| Variable | Coefficient | p value |
+|:---------|-------------|---------|
+| (Intercept)              |  5.195e+03  | 7.49e-16 |
+| reporails                |  5.164e+03  | 2.40e-13 |
+| reponode                 |  1.647e+03  | 0.017772 |
+| repojquery               |  3.513e+03  | 0.000447 |
+| reporust                 |  3.552e+03  | 2.51e-08 |
+| repowebpack              | -2.102e+03  | 0.007918 |
+| repoember                |  3.774e+03  | 5.65e-09 |
+| diff                     | -3.515e-05  | 0.041160 |
+| avg_commit_size          |  2.220e-01  | 0.091728 |
+| sentiment_toward_notable |  1.332e+03  | 0.283753 |
+: Linear fixed-effects model of $\sqrt{length}$
+
+The coefficients of the fixed-effects model predicting $\sqrt{length}$ are
+shown in Table 6. The model has an overall p-value of near 0 and an $R^2$ of 
+0.3143.
+
+| Variable | Coefficient |
+|:---------|-------------|
+| Intercept: bundler  |  6459.471 |
+| Intercept: rails    | 11527.773 |
+| Intercept: node     |  7939.249 |
+| Intercept: jquery   |  9422.563 |
+| Intercept: rust     |  9802.262 |
+| Intercept: webpack  |  4150.067 |
+| Intercept: ember    |  9948.491 |
+| gendermale | -359.8853 |
+| genderunknown | -1886.643 |
+| sentiment_toward_other | -1139.63 |
+: Linear mixed-effects model of $\sqrt{length}$
+
+The coefficients of the mixed-effects model predicting $\sqrt{length}$ is
+shown in Table 7. The model has a p-value of 0.008551 compared to the null
+model with just the random effect of the project.
+
+| Model                  | Mean Squared Error | Mean of Response Variable | % Error |
+| -----------------------|--------------------|---------------------------|---------|
+| Length fixed-effects   | 8477573 | 8130.209 | 1042.725 % |
+| Length mixed-effects   | 9460454 | 8130.209 | 1163.618 % |
+: Results of Monte Carlo cross validation for predicting $\sqrt{length}$ 
+
+Table 8 shows the results of performing Monte Carlo cross validation for 100
+iterations on the length models. The fixed-effects model performs slightly
+better than the mixed-effects model, but the MSE is extremely high, indicating
+that the model is over-fit to the data.
+
+```{r, fig.show='asis', fig.cap='Residual plots for length models. The blue line is a linear line of best fit.', fig.height=3}
+grid.arrange(length_linear_residuals, length_lmer_residuals, ncol=2)
+```
+
+Figure 6 shows the residual plots for these models, and both
+show a pretty good spread of residuals: the errors are spread roughly equally
+between large and small fitted values.
+
+# Discussion
+
+Out of all 4 final models, the only one that is useful for analysis is
+the linear fixed-effects model for the total number of commits, and the 
+only significant variables in this model were the project and sentiment
+expressed towards users by other known users. Unexpectedly, an average of
+more negative sentiment is found with more total commits. This can perhaps be
+explained by regular contributors feeling more comfortable with each other;
+most people are more polite to strangers. 
+
+Gender is not an important predictor, which is particularly surprising given
+that there are significant sexism issues in the open source community. The fact
+that it was not significant here could mean that these issues need to be addressed
+more urgently outside of the communities within single projects; if a non-man
+is already at the point where they've contributed to a project, they have already
+overcome significant issues and do not seem to face any other significant
+gender-related obstacles after getting to this point.
+
+## Future Work
+
+This project is simply a starting point for this type of work and has
+some obvious room for improvement. Most importantly, a better system
+for determining gender should be developed; names aren't the most accurate
+way of going about this. A more advanced analysis could include user avatar
+images, for example. The sentiment analysis of comments could also benefit
+from improvement: a bag-of-words representation is computationally fast, but
+a better model like Naive Bayes or actually using IBM Watson APIs would likely
+be much more useful.
+
+More data from other online sources could also be incredibly useful for this 
+analysis: the open source community isn't just on GitHub, after all. Many
+important open source figures are very active on Twitter and various mailing
+lists, and data from these sources could be used to get a better sense
+of projects' communities.
+
+# Source Code
+Source code for this project can be found [here](https://github.com/esoterik/thesis_data)
+and [here](https://github.com/esoterik/thesis_analysis).
+
+# References
+
+Carillo, Kevin, et al. “What Makes a Good Contributor? Understanding Contributor Behavior within Large Free/Open Source Software Projects – A Socialization Perspective.” The Journal of Strategic Information Systems, 30 Mar. 2017, www.sciencedirect.com/science/article/pii/S0963868716301196.
+
+Eghbal, Nadia. “We're in a Brave, New Post Open Source World.” Medium, Medium, 28 Jan. 2016, medium.com/@nayafia/we-re-in-a-brave-new-post-open-source-world-56ef46d152a3.
+
+Sheather, Simon J. A Modern Approach to Regression with R. New York: Springer, 2010. Print.
+
+# Acknowledgements
+
+This project would not have been possible without all of the open source software
+it was written in, including Ruby on Rails, R, the sentimental ruby gem,
+the faraday ruby gem, the R package lme4, and the R package ggplot2, among
+many others that can be found in the source code.
